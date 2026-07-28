@@ -14,7 +14,7 @@
  * ║                                                              ║
  * ╚══════════════════════════════════════════════════════════════╝
  *
- * detritus.c -- Event-Driven Memory Manager for Linux
+ * gonzocache.c -- Recently used app caching for Linux
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
