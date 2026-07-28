@@ -1,0 +1,40 @@
+#!/sbin/openrc-run
+# gonzocache -- app launch tracker + preload helper (OpenRC service, --track mode)
+#
+# gonzocache.c's run_track_mode() is a foreground blocking loop (while
+# (g_running) { sleep(...); scan_once(); ... }) that never forks/setsid's
+# itself into the background -- same shape as detritus.c's main(), same
+# reason for using start-stop-daemon --background here rather than
+# assuming the binary self-daemonizes.
+#
+# Unlike detritus, gonzocache's --track mode logs via vsyslog (main()
+# calls openlog("gonzocache", ...) before entering the track loop when
+# --track is passed), so there is no output_log/error_log redirection
+# here -- its log lines already go to syslog/the journal on their own,
+# not to stdout/stderr the way detritus's rp_log() writes to both
+# syslog and a dedicated file.
+#
+# This service only runs --track (continuous launch-history recording).
+# --preload (the one-shot, login-time cache-warming pass) is
+# deliberately NOT run from here -- it needs to fire once per desktop
+# login, which an OpenRC service started once at boot has no natural
+# way to represent. See gonzocache-preload.sh (installed to
+# /etc/X11/Xsession.d/) for that half.
+
+name="gonzocache"
+description="App launch tracker for GonzoCache preloading"
+command="/usr/local/sbin/gonzocache"
+command_args="--track"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	# Same reasoning as detritus.openrc: depend on the boot RUNLEVEL,
+	# not a specific service name inside it, since a hard-named
+	# service dependency (e.g. "need localmount") failed on the real
+	# target system during detritus's own OpenRC integration -- exact
+	# mount-related service names aren't universal across every
+	# Devuan/OpenRC install. gonzocache needs /proc and /var/lib to be
+	# writable, which "after boot" already guarantees.
+	after boot
+}
