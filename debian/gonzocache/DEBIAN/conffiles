@@ -1,0 +1,3 @@
+/etc/sv/gonzocache/log/run/run
+/etc/sv/gonzocache/run/gonzocache.run
+/etc/xdg/autostart/gonzocache-preload.desktop

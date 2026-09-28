@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if [ -d /etc/service ]; then
+            if [ -e /etc/service/gonzocache ] || [ -L /etc/service/gonzocache ]; then
+                if [ "$(readlink /etc/service/gonzocache 2>/dev/null || true)" != /etc/sv/gonzocache ]; then
+                    echo "refusing to replace existing /etc/service/gonzocache" >&2
+                    exit 1
+                fi
+            else
+                ln -s /etc/sv/gonzocache /etc/service/gonzocache
+            fi
+            sv up gonzocache >/dev/null 2>&1 || true
+        fi
+        ;;
+esac

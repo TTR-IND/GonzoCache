@@ -1,0 +1,3 @@
+./debian/gonzocache-preload.desktop
+./debian/gonzocache.run
+./runit/log/run

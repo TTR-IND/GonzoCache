@@ -1,0 +1,12 @@
+Package: gonzocache
+Version: 1.0.0-1
+Architecture: amd64
+Maintainer: GonzOS Packaging <packages@gonzos.invalid>
+Installed-Size: 51
+Depends: runit
+Section: admin
+Priority: optional
+Description: login-time application cache warmer and tracker
+ gonzocache tracks application launches and warms frequently used executables
+ and mapped files into the page cache.  It includes a runit tracker service
+ and a desktop-login preload entry.

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+
+if [ "$(readlink /etc/service/gonzocache 2>/dev/null || true)" = /etc/sv/gonzocache ]; then
+    rm -f /etc/service/gonzocache
+fi
