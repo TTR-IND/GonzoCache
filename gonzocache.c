@@ -1,86 +1,39 @@
 /*
- * ╔══════════════════════════════════════════════════════════════╗
- * ║                                                              ║
- * ║   ████████╗████████╗██████╗       ██╗███╗   ██╗██████╗       ║
- * ║   ╚══██╔══╝╚══██╔══╝██╔══██╗      ██║████╗  ██║██╔══██╗      ║
- * ║      ██║      ██║   ██████╔╝      ██║██╔██╗ ██║██║  ██║      ║
- * ║      ██║      ██║   ██╔══██╗      ██║██║╚██╗██║██║  ██║      ║
- * ║      ██║      ██║   ██║  ██║      ██║██║ ╚████║██████╔╝      ║
- * ║      ╚═╝      ╚═╝   ╚═╝  ╚═╝      ╚═╝╚═╝  ╚═══╝╚═════╝       ║
- * ║                                                              ║
- * ║       Torfaen Technology Research — IND                      ║
- * ║       Copyright © 2026                                       ║
- * ║       Licensed under Apache License 2.0                      ║
- * ║                                                              ║
- * ╚══════════════════════════════════════════════════════════════╝
+ * gonzocache.c -- Launch tracker and watermarked file cache for Linux
  *
- * gonzocache.c -- Recently used app caching for Linux
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
+ * Licensed under the Apache License, Version 2.0.
  *
  * Two modes, one binary:
  *
- *   gonzocache --track    Runs continuously (as a service), lightly
- *                         polling /proc every TRACK_INTERVAL_SEC to
- *                         detect new process launches, and updates a
- *                         persistent, exponentially-decayed launch
- *                         score per executable in
- *                         /var/lib/gonzocache/history.json.
+ *   gonzocache --track    Root service. Records launches with an
+ *                         exponentially-decayed score, and holds the
+ *                         top executables (plus the files they actually
+ *                         mapped at last launch) in the page cache.
+ *                         A monitor thread drops that hold when
+ *                         MemAvailable crosses the low watermark, and
+ *                         warms again when RAM is comfortable.
  *
- *   gonzocache --preload  Runs once, reads the scored history, and
- *                         calls posix_fadvise(POSIX_FADV_WILLNEED) on
- *                         the top PRELOAD_TOP_N executables (pulling
- *                         them into the page cache without executing
- *                         them), then exits immediately. Meant to be
- *                         invoked once at login/boot, per explicit
- *                         design decision -- this is not a persistent
- *                         background preloader.
+ *   gonzocache --preload  One-shot login helper. posix_fadvise + a
+ *                         sequential touch of the same ranked list,
+ *                         then exits. Does not pin. Safe to run as
+ *                         the desktop user.
  *
- * Design notes:
+ * The cache is file-backed. Pages live in the kernel page cache, which
+ * is what a subsequent exec() actually hits. A private anonymous copy
+ * of the file (mmap ANONYMOUS + read + mlock) is a second heap that
+ * exec() will not use — that was the old hotcache mistake.
  *
- *   - This is a genuinely separate daemon from detritus, not a feature
- *     bolted onto it. detritus's whole job is giving memory back
- *     (reactive freeze under real pressure, proactive MADV_COLD
- *     trickle when idle); GonzoCache's job is the opposite -- spending
- *     memory proactively on a bet that it improves perceived launch
- *     speed. Mixing "give memory back" and "consume memory
- *     speculatively" in one daemon would let the two features fight
- *     each other's decisions in ways that are hard to reason about.
- *     Two daemons with one clear job each stays honestly debuggable.
+ * Pinning uses mlock on the file map, and only in --track when running
+ * as root. mlock is the "stay resident across streaming I/O" part.
+ * Without it the kernel can evict the warm pages the moment a video
+ * player reads a few hundred megabytes. With it, only this daemon's
+ * watermark may drop them.
  *
- *   - Launch detection is /proc-diffing, not proc connector (netlink
- *     PROC_EVENT_EXEC). proc connector was tested first, on both a
- *     sandboxed container and real Devuan hardware, and delivered zero
- *     genuine process-lifecycle events on either -- only protocol-
- *     level acks. /proc polling is a proven-working primitive on this
- *     exact hardware (confirmed directly, not assumed), so there is no
- *     remaining uncertainty about whether it works here.
- *     The real cost of polling over event-driven tracking is that a
- *     process which starts and exits entirely between two poll
- *     intervals is invisible -- an acceptable trade for "apps you
- *     commonly launch and use", which are not typically sub-second
- *     one-shot commands.
- *
- *   - Scoring is exponential decay, not separate frequency/recency
- *     fields hand-balanced against each other. Each launch adds a
- *     fixed increment to a running score; the score decays by a
- *     half-life between launches. This naturally weights "frequent
- *     AND recent" without needing a hand-tuned blend formula: an app
- *     launched daily keeps climbing, one launched once and never again
- *     decays toward irrelevance, and the ranking self-adjusts as usage
- *     patterns change over time.
+ * Detritus is a separate process. This daemon spends file-cache on a
+ * launch-speed bet. Detritus gives anonymous memory back under
+ * pressure. They meet only at /var/lib/gonzocache/preloaded.list.
  */
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -91,23 +44,43 @@
 #include <unistd.h>
 #include <time.h>
 #include <math.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <syslog.h>
+#include <pthread.h>
 #include <signal.h>
+#include <syslog.h>
+#include <dirent.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 /* ── Tunables ─────────────────────────────────────────────────────────── */
-#define TRACK_INTERVAL_SEC   3        /* /proc poll period for --track     */
-#define HALF_LIFE_SEC        (7 * 24 * 3600)   /* 7 days                   */
-#define LAUNCH_INCREMENT     1.0
-#define PRELOAD_TOP_N        12
-#define MIN_SCORE_TO_PRELOAD 0.05     /* ignore near-zero-decayed entries  */
-#define MAX_TRACKED_EXES     512
+
+#define TRACK_INTERVAL_SEC     3
+#define HALF_LIFE_SEC          (7 * 24 * 3600)
+#define LAUNCH_INCREMENT       1.0
+#define PRELOAD_TOP_N          12
+#define MIN_SCORE_TO_PRELOAD   0.05
+#define MAX_TRACKED_EXES       512
+#define MAX_FILES_PER_EXE      24
+#define MAX_HOLD               64
+
+#define SAVE_INTERVAL_SEC      60
+#define POLL_INTERVAL_MS       500
+
+#define CACHE_BUDGET_PERCENT   15          /* of MemTotal                     */
+#define CACHE_BUDGET_CAP_BYTES (384ul * 1024ul * 1024ul)
+#define MAX_FILE_BYTES         (32ul * 1024ul * 1024ul)
+#define READ_CHUNK_SIZE        (1 * 1024 * 1024)
+
+#define LOW_WATERMARK_KB       (400 * 1024)
+#define RECOVER_WATERMARK_KB   (600 * 1024)
+#define WARM_MIN_AVAIL_KB      (800 * 1024)
 
 #define HISTORY_DIR  "/var/lib/gonzocache"
 #define HISTORY_PATH HISTORY_DIR "/history.json"
+#define PRELOADED_PATH HISTORY_DIR "/preloaded.list"
+#define STATS_PATH     HISTORY_DIR "/stats"
 
-/* ── Logging -- mirrors detritus.c's rp_log() shape for consistency ────── */
+/* ── Logging ──────────────────────────────────────────────────────────── */
+
 static int g_use_syslog = 0;
 
 static void gc_log(int priority, const char *fmt, ...)
@@ -118,7 +91,8 @@ static void gc_log(int priority, const char *fmt, ...)
         vsyslog(priority, fmt, ap);
     } else {
         time_t t = time(NULL);
-        struct tm tmv; localtime_r(&t, &tmv);
+        struct tm tmv;
+        localtime_r(&t, &tmv);
         char ts[16];
         strftime(ts, sizeof(ts), "%H:%M:%S", &tmv);
         fprintf(stderr, "[gonzocache %s] ", ts);
@@ -128,39 +102,68 @@ static void gc_log(int priority, const char *fmt, ...)
     va_end(ap);
 }
 
-/* ── Persistent launch history ───────────────────────────────────────────
- *
- * Keyed by resolved executable path (from /proc/pid/exe), not by comm
- * name -- comm is truncated to 15 characters by the kernel and can
- * collide between genuinely different binaries; the full resolved path
- * is the only identifier that's actually unambiguous.
- *
- * score is exponentially decayed: on load, and again before writing,
- * every entry's score is decayed forward to "now" based on
- * last_launch_unix, so entries that haven't been touched in a long
- * time reflect their true current (decayed) score rather than a stale
- * value frozen at whatever it was on their last actual launch.
- */
+/* ── Meminfo ──────────────────────────────────────────────────────────── */
+
+static long read_meminfo_kb(const char *key)
+{
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[256];
+    long val = -1;
+    size_t klen = strlen(key);
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, key, klen) == 0) {
+            sscanf(line + klen, "%ld", &val);
+            break;
+        }
+    }
+    fclose(f);
+    return val;
+}
+
+/* ── History ──────────────────────────────────────────────────────────── */
+
 typedef struct {
     char   path[256];
     double score;
     time_t last_launch_unix;
+    char   files[MAX_FILES_PER_EXE][256];
+    int    n_files;
 } history_entry_t;
 
 static history_entry_t g_history[MAX_TRACKED_EXES];
 static int             g_n_history = 0;
 
-/* Exponential decay factor for a gap of `elapsed_sec` seconds, given
- * HALF_LIFE_SEC. decay = 0.5^(elapsed/half_life) -- standard half-life
- * decay, so a score exactly one half-life old is worth half what it
- * was, two half-lives old is worth a quarter, and so on. */
+static const char *SKIP_BASENAME[] = {
+    "gonzocache", "detritusd", "rookpager",
+    "sh", "dash", "bash", "login", "sudo", "su",
+    "sleep", "cat", "sed", "awk", "grep",
+    NULL
+};
+
+static const char *basename_of(const char *path)
+{
+    const char *s = strrchr(path, '/');
+    return s ? s + 1 : path;
+}
+
+static int should_skip_path(const char *path)
+{
+    if (!path || path[0] != '/') return 1;
+    if (strncmp(path, "/proc/", 6) == 0) return 1;
+    if (strncmp(path, "/dev/", 5) == 0) return 1;
+    const char *base = basename_of(path);
+    for (int i = 0; SKIP_BASENAME[i]; i++)
+        if (strcmp(base, SKIP_BASENAME[i]) == 0) return 1;
+    return 0;
+}
+
 static double decay_factor(time_t elapsed_sec)
 {
     if (elapsed_sec <= 0) return 1.0;
     return pow(0.5, (double)elapsed_sec / (double)HALF_LIFE_SEC);
 }
 
-/* Find an existing entry for `path`, or NULL if not tracked yet. */
 static history_entry_t *history_find(const char *path)
 {
     for (int i = 0; i < g_n_history; i++)
@@ -168,35 +171,60 @@ static history_entry_t *history_find(const char *path)
     return NULL;
 }
 
-/* Record a launch of `path` at the given time, applying decay to the
- * existing score (if any) before adding the increment for this launch.
- * If the table is full and this is a new path, the entry with the
- * lowest current (already-decayed) score is evicted -- a bounded
- * table with LRU-by-score eviction, so a machine with many distinct
- * binaries launched over time can't grow this file without bound. */
-static void history_record_launch(const char *path, time_t now)
+static void files_add(history_entry_t *e, const char *path)
 {
+    if (!e || should_skip_path(path)) return;
+    if (e->n_files >= MAX_FILES_PER_EXE) return;
+    for (int i = 0; i < e->n_files; i++)
+        if (strcmp(e->files[i], path) == 0) return;
+    snprintf(e->files[e->n_files], sizeof(e->files[0]), "%s", path);
+    e->n_files++;
+}
+
+static void harvest_maps(pid_t pid, history_entry_t *e)
+{
+    char path[32];
+    snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = strchr(line, '/');
+        if (!p) continue;
+        size_t n = strlen(p);
+        while (n > 0 && (p[n - 1] == '\n' || p[n - 1] == '\r')) p[--n] = '\0';
+        char *cut = strchr(p, ' ');
+        if (cut) *cut = '\0';
+        files_add(e, p);
+    }
+    fclose(f);
+}
+
+static void history_record_launch(const char *path, pid_t pid, time_t now)
+{
+    if (should_skip_path(path)) return;
+
     history_entry_t *e = history_find(path);
     if (!e) {
         if (g_n_history < MAX_TRACKED_EXES) {
             e = &g_history[g_n_history++];
+            memset(e, 0, sizeof(*e));
             snprintf(e->path, sizeof(e->path), "%s", path);
-            e->score = 0.0;
             e->last_launch_unix = now;
         } else {
-            /* Table full -- evict the lowest-scored entry (decayed to
-             * "now" first, so we're comparing true current standing,
-             * not stale historical peaks) to make room. */
             int lowest_idx = 0;
             double lowest_score = 1e300;
             for (int i = 0; i < g_n_history; i++) {
                 double s = g_history[i].score *
                     decay_factor(now - g_history[i].last_launch_unix);
-                if (s < lowest_score) { lowest_score = s; lowest_idx = i; }
+                if (s < lowest_score) {
+                    lowest_score = s;
+                    lowest_idx = i;
+                }
             }
             e = &g_history[lowest_idx];
+            memset(e, 0, sizeof(*e));
             snprintf(e->path, sizeof(e->path), "%s", path);
-            e->score = 0.0;
             e->last_launch_unix = now;
         }
     }
@@ -204,13 +232,10 @@ static void history_record_launch(const char *path, time_t now)
     double decay = decay_factor(now - e->last_launch_unix);
     e->score = e->score * decay + LAUNCH_INCREMENT;
     e->last_launch_unix = now;
+    files_add(e, path);
+    harvest_maps(pid, e);
 }
 
-/* Find the value following "key": in buf. Scoped parser matching the
- * same design decision as gonzo-detritus.cpp's status.json reader --
- * this schema is small, fixed, and owned entirely by this project, so
- * a hand-rolled scoped parser is proportionate to not linking a JSON
- * library for it. */
 static const char *gc_find_key(const char *buf, const char *key)
 {
     char pattern[64];
@@ -224,7 +249,7 @@ static const char *gc_find_key(const char *buf, const char *key)
 
 static int gc_extract_string(const char *p, char *out, size_t outlen)
 {
-    if (*p != '"') return 0;
+    if (!p || *p != '"') return 0;
     p++;
     size_t i = 0;
     while (*p && *p != '"' && i + 1 < outlen) out[i++] = *p++;
@@ -232,20 +257,17 @@ static int gc_extract_string(const char *p, char *out, size_t outlen)
     return 1;
 }
 
-/* Load history.json into g_history. Missing file is not an error --
- * first run on a fresh install has no history yet, which is expected,
- * not exceptional. A corrupt/unparseable file is logged and treated
- * the same as missing (start fresh) rather than crashing -- losing
- * accumulated history is a minor, recoverable annoyance; refusing to
- * start because of one bad file would not be proportionate. */
 static void history_load(void)
 {
     g_n_history = 0;
     FILE *f = fopen(HISTORY_PATH, "r");
     if (!f) return;
 
-    char *buf = malloc(1 << 20);  /* 1MB, generous for MAX_TRACKED_EXES */
-    if (!buf) { fclose(f); return; }
+    char *buf = malloc(1 << 20);
+    if (!buf) {
+        fclose(f);
+        return;
+    }
     size_t n = fread(buf, 1, (1 << 20) - 1, f);
     fclose(f);
     buf[n] = '\0';
@@ -253,38 +275,42 @@ static void history_load(void)
     const char *p = buf;
     while ((p = strstr(p, "\"path\":")) != NULL && g_n_history < MAX_TRACKED_EXES) {
         history_entry_t *e = &g_history[g_n_history];
+        memset(e, 0, sizeof(*e));
         const char *pathval = gc_find_key(p, "path");
         if (!pathval || !gc_extract_string(pathval, e->path, sizeof(e->path))) {
-            p += 7; continue;
+            p += 7;
+            continue;
         }
         const char *scoreval = gc_find_key(p, "score");
         e->score = scoreval ? strtod(scoreval, NULL) : 0.0;
         const char *lastval = gc_find_key(p, "last_launch_unix");
         e->last_launch_unix = lastval ? (time_t)strtoll(lastval, NULL, 10) : 0;
 
-        /* Bound the search for score/last_launch to roughly this
-         * object -- gc_find_key has no concept of object boundaries,
-         * matching the same accepted trade-off as
-         * gonzo-detritus.cpp's parse_candidates(). 200 bytes
-         * comfortably covers one history entry at this schema's
-         * field widths. */
+        const char *files = strstr(p, "\"files\":");
+        const char *next = strstr(p + 7, "\"path\":");
+        if (files && (!next || files < next)) {
+            const char *q = files;
+            while ((q = strstr(q, "\"")) != NULL && e->n_files < MAX_FILES_PER_EXE) {
+                if (next && q >= next) break;
+                char tmp[256];
+                if (!gc_extract_string(q, tmp, sizeof(tmp))) break;
+                if (strcmp(tmp, "files") != 0 && tmp[0] == '/')
+                    files_add(e, tmp);
+                q += strlen(tmp) + 2;
+                if (*q == ']') break;
+            }
+        }
+
         g_n_history++;
         p += 7;
     }
     free(buf);
-
     gc_log(LOG_INFO, "loaded %d history entries from %s", g_n_history, HISTORY_PATH);
 }
 
-/* Save g_history to history.json via mkstemp+write+rename, same
- * atomicity contract as detritus.c's write_status_file() -- a reader
- * (there isn't one for this file currently, but the discipline costs
- * nothing and matches the project's established convention) should
- * never observe a torn write. */
 static void history_save(void)
 {
     mkdir(HISTORY_DIR, 0755);
-
     char tmp_path[64];
     snprintf(tmp_path, sizeof(tmp_path), HISTORY_DIR "/.history.XXXXXX");
     int fd = mkstemp(tmp_path);
@@ -293,60 +319,295 @@ static void history_save(void)
         return;
     }
     fchmod(fd, 0644);
-
     FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); unlink(tmp_path); return; }
+    if (!f) {
+        close(fd);
+        unlink(tmp_path);
+        return;
+    }
 
     fprintf(f, "{\n  \"schema_version\": 1,\n  \"entries\": [\n");
     for (int i = 0; i < g_n_history; i++) {
         fprintf(f,
-            "    { \"path\": \"%s\", \"score\": %.6f, \"last_launch_unix\": %ld }%s\n",
+            "    { \"path\": \"%s\", \"score\": %.6f, \"last_launch_unix\": %ld, \"files\": [",
             g_history[i].path, g_history[i].score,
-            (long)g_history[i].last_launch_unix,
-            (i == g_n_history - 1) ? "" : ",");
+            (long)g_history[i].last_launch_unix);
+        for (int k = 0; k < g_history[i].n_files; k++)
+            fprintf(f, "%s\"%s\"", k ? ", " : "", g_history[i].files[k]);
+        fprintf(f, "] }%s\n", (i == g_n_history - 1) ? "" : ",");
     }
     fprintf(f, "  ]\n}\n");
-
     fflush(f);
     fsync(fd);
     fclose(f);
-
     if (rename(tmp_path, HISTORY_PATH) != 0) {
         gc_log(LOG_WARNING, "history save: rename failed: %s", strerror(errno));
         unlink(tmp_path);
     }
 }
 
-/* ── /proc-diffing launch scanner (--track mode) ─────────────────────────
- *
- * Not proc connector (netlink PROC_EVENT_EXEC) -- tested directly on
- * both a sandboxed environment and real Devuan hardware, and delivered
- * zero genuine process-lifecycle events on either, only protocol-level
- * acks. /proc polling is a proven-working primitive on this exact
- * hardware (confirmed directly, not assumed).
- *
- * Cost: a process that starts and fully exits between two
- * TRACK_INTERVAL_SEC polls is invisible to this scanner. Accepted
- * trade-off -- "apps you commonly launch and use" are not typically
- * sub-second one-shot commands, and the alternative (proc connector)
- * is simply not available on this system regardless of trade-offs.
+static void history_rank_now(void)
+{
+    time_t now = time(NULL);
+    for (int i = 0; i < g_n_history; i++) {
+        g_history[i].score *= decay_factor(now - g_history[i].last_launch_unix);
+        g_history[i].last_launch_unix = now;
+    }
+    for (int i = 1; i < g_n_history; i++) {
+        history_entry_t key = g_history[i];
+        int j = i - 1;
+        while (j >= 0 && g_history[j].score < key.score) {
+            g_history[j + 1] = g_history[j];
+            j--;
+        }
+        g_history[j + 1] = key;
+    }
+}
+
+/* ── Hold table (file-backed maps) ────────────────────────────────────── */
+
+typedef struct {
+    void  *map;
+    size_t size;
+    int    fd;
+    int    locked;
+    char   path[256];
+} hold_slot_t;
+
+static hold_slot_t     g_hold[MAX_HOLD];
+static int             g_n_hold = 0;
+static size_t          g_hold_bytes = 0;
+static size_t          g_budget_bytes = 0;
+static pthread_mutex_t g_hold_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             g_can_lock = 0;
+
+static void write_preloaded_list(void)
+{
+    mkdir(HISTORY_DIR, 0755);
+    char tmp[64];
+    snprintf(tmp, sizeof(tmp), HISTORY_DIR "/.preloaded.XXXXXX");
+    int fd = mkstemp(tmp);
+    if (fd < 0) return;
+    fchmod(fd, 0644);
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        close(fd);
+        unlink(tmp);
+        return;
+    }
+    pthread_mutex_lock(&g_hold_lock);
+    for (int i = 0; i < g_n_hold; i++)
+        fprintf(f, "%s\n", g_hold[i].path);
+    size_t held = g_hold_bytes;
+    int n = g_n_hold;
+    pthread_mutex_unlock(&g_hold_lock);
+    fflush(f);
+    fsync(fd);
+    fclose(f);
+    if (rename(tmp, PRELOADED_PATH) != 0) unlink(tmp);
+
+    FILE *sf = fopen(STATS_PATH, "w");
+    if (sf) {
+        fprintf(sf, "status=ok\n");
+        fprintf(sf, "files_held=%d\n", n);
+        fprintf(sf, "held_mb=%zu\n", held / 1024 / 1024);
+        fprintf(sf, "budget_mb=%zu\n", g_budget_bytes / 1024 / 1024);
+        fclose(sf);
+    }
+}
+
+static void hold_drop_index_unlocked(int i, int drop_pages)
+{
+    hold_slot_t *s = &g_hold[i];
+    if (s->map && s->size) {
+        if (s->locked) munlock(s->map, s->size);
+        if (drop_pages) madvise(s->map, s->size, MADV_DONTNEED);
+        munmap(s->map, s->size);
+    }
+    if (s->fd >= 0) close(s->fd);
+    if (g_hold_bytes >= s->size) g_hold_bytes -= s->size;
+    else g_hold_bytes = 0;
+    g_hold[i] = g_hold[g_n_hold - 1];
+    memset(&g_hold[g_n_hold - 1], 0, sizeof(g_hold[0]));
+    g_n_hold--;
+}
+
+static void hold_drop_all(int drop_pages)
+{
+    pthread_mutex_lock(&g_hold_lock);
+    while (g_n_hold > 0)
+        hold_drop_index_unlocked(g_n_hold - 1, drop_pages);
+    pthread_mutex_unlock(&g_hold_lock);
+}
+
+static int hold_contains_unlocked(const char *path)
+{
+    for (int i = 0; i < g_n_hold; i++)
+        if (strcmp(g_hold[i].path, path) == 0) return 1;
+    return 0;
+}
+
+/*
+ * Map the file shared (so the pages ARE the page cache), fault it in
+ * with a sequential read-sized touch, optionally mlock.
+ * Returns bytes held, or 0 on skip/fail.
  */
+static size_t hold_one(const char *path, int pin)
+{
+    if (!path || path[0] != '/') return 0;
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0)
+        return 0;
+    size_t file_size = (size_t)st.st_size;
+    if (file_size > MAX_FILE_BYTES) file_size = MAX_FILE_BYTES;
+
+    pthread_mutex_lock(&g_hold_lock);
+    if (hold_contains_unlocked(path) || g_n_hold >= MAX_HOLD ||
+        g_hold_bytes + file_size > g_budget_bytes) {
+        pthread_mutex_unlock(&g_hold_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_hold_lock);
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    void *map = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        close(fd);
+        return 0;
+    }
+
+    /*
+     * Sequential touch. On eMMC a 1MB stride matches the device's
+     * happy sequential width better than a page-at-a-time walk, and
+     * posix_fadvise alone is only a hint — the kernel may ignore it
+     * under load. Touching forces the pages in.
+     */
+    posix_fadvise(fd, 0, (off_t)file_size, POSIX_FADV_WILLNEED);
+    volatile unsigned char acc = 0;
+    const unsigned char *p = (const unsigned char *)map;
+    for (size_t off = 0; off < file_size; off += READ_CHUNK_SIZE)
+        acc ^= p[off];
+    acc ^= p[file_size - 1];
+    (void)acc;
+
+    int locked = 0;
+    if (pin && g_can_lock) {
+        if (mlock(map, file_size) == 0) locked = 1;
+    }
+
+    pthread_mutex_lock(&g_hold_lock);
+    if (g_n_hold >= MAX_HOLD || g_hold_bytes + file_size > g_budget_bytes) {
+        pthread_mutex_unlock(&g_hold_lock);
+        if (locked) munlock(map, file_size);
+        munmap(map, file_size);
+        close(fd);
+        return 0;
+    }
+    hold_slot_t *s = &g_hold[g_n_hold++];
+    s->map = map;
+    s->size = file_size;
+    s->fd = fd;
+    s->locked = locked;
+    snprintf(s->path, sizeof(s->path), "%s", path);
+    g_hold_bytes += file_size;
+    pthread_mutex_unlock(&g_hold_lock);
+    return file_size;
+}
+
+static int warm_from_history(int pin)
+{
+    history_rank_now();
+
+    long avail = read_meminfo_kb("MemAvailable:");
+    if (avail >= 0 && avail < WARM_MIN_AVAIL_KB) {
+        gc_log(LOG_INFO, "warm skipped — MemAvailable=%ld MiB", avail / 1024);
+        return 0;
+    }
+
+    int warmed = 0;
+    for (int i = 0; i < g_n_history && warmed < PRELOAD_TOP_N; i++) {
+        if (g_history[i].score < MIN_SCORE_TO_PRELOAD) break;
+
+        size_t got = hold_one(g_history[i].path, pin);
+        if (got) {
+            gc_log(LOG_INFO, "held: %s (score=%.2f %zu KiB%s)",
+                   g_history[i].path, g_history[i].score, got / 1024,
+                   pin ? " pinned" : "");
+            warmed++;
+        }
+        for (int k = 0; k < g_history[i].n_files; k++) {
+            if (strcmp(g_history[i].files[k], g_history[i].path) == 0)
+                continue;
+            hold_one(g_history[i].files[k], pin);
+        }
+    }
+    write_preloaded_list();
+    gc_log(LOG_INFO, "warm complete: %d apps, %zu MiB / %zu MiB budget",
+           warmed, g_hold_bytes / 1024 / 1024, g_budget_bytes / 1024 / 1024);
+    return warmed;
+}
+
+static void purge_until(long target_kb)
+{
+    int dropped = 0;
+    pthread_mutex_lock(&g_hold_lock);
+    while (g_n_hold > 0) {
+        long avail = read_meminfo_kb("MemAvailable:");
+        if (avail < 0 || avail >= target_kb) break;
+        /* Drop the last slot — newest hold is the speculative tail. */
+        gc_log(LOG_INFO, "purge: %s (%zu KiB)",
+               g_hold[g_n_hold - 1].path, g_hold[g_n_hold - 1].size / 1024);
+        hold_drop_index_unlocked(g_n_hold - 1, 1);
+        dropped++;
+    }
+    pthread_mutex_unlock(&g_hold_lock);
+    if (dropped) write_preloaded_list();
+}
+
+static volatile sig_atomic_t g_running = 1;
+static void gc_sig_handler(int sig) { (void)sig; g_running = 0; }
+
+static void *monitor_thread(void *arg)
+{
+    (void)arg;
+    int purged = 0;
+    while (g_running) {
+        struct timespec ts = {
+            .tv_sec  = POLL_INTERVAL_MS / 1000,
+            .tv_nsec = (POLL_INTERVAL_MS % 1000) * 1000000L,
+        };
+        nanosleep(&ts, NULL);
+        if (!g_running) break;
+
+        long avail = read_meminfo_kb("MemAvailable:");
+        if (avail < 0) continue;
+
+        if (avail < LOW_WATERMARK_KB && g_n_hold > 0) {
+            gc_log(LOG_INFO, "pressure: MemAvailable=%ld MiB — purging hold",
+                   avail / 1024);
+            purge_until(RECOVER_WATERMARK_KB);
+            purged = 1;
+        } else if (purged && avail > WARM_MIN_AVAIL_KB && g_n_hold == 0) {
+            gc_log(LOG_INFO, "recovered: MemAvailable=%ld MiB — rewarming",
+                   avail / 1024);
+            warm_from_history(1);
+            purged = 0;
+        }
+    }
+    return NULL;
+}
+
+/* ── Tracker ──────────────────────────────────────────────────────────── */
+
 #define MAX_SEEN_PIDS 4096
 
 typedef struct { pid_t pid; unsigned long long starttime; } seen_pid_t;
 
 static seen_pid_t g_seen_pids[MAX_SEEN_PIDS];
 static int        g_n_seen = 0;
-
-/* Graceful shutdown: set by SIGTERM/SIGINT, checked by run_track_mode()'s
- * main loop. Matches detritus.c's own sig_handler pattern for
- * consistency. Without this, any launches recorded since the last
- * periodic (60s) save would be silently lost on every normal
- * stop/restart -- found by actually running the daemon end-to-end and
- * observing the history file was empty after a short-lived test run,
- * not caught by inspection alone. */
-static volatile sig_atomic_t g_running = 1;
-static void gc_sig_handler(int sig) { (void)sig; g_running = 0; }
 
 static int seen_contains(pid_t pid, unsigned long long starttime)
 {
@@ -356,10 +617,6 @@ static int seen_contains(pid_t pid, unsigned long long starttime)
     return 0;
 }
 
-/* Resolve a PID's real executable path via /proc/pid/exe. Returns 0 on
- * failure (kernel thread with no exe symlink, process exited between
- * directory listing and readlink -- an expected, not exceptional,
- * race given this is a live, changing directory). */
 static int resolve_exe_path(pid_t pid, char *out, size_t outlen)
 {
     char link_path[32];
@@ -370,10 +627,6 @@ static int resolve_exe_path(pid_t pid, char *out, size_t outlen)
     return 1;
 }
 
-/* Read starttime (field 22 of /proc/pid/stat) -- a PID-reuse-safe
- * identifier: a PID number alone can be recycled between scans, and
- * without this a scanner could silently attribute a new process's
- * first appearance to a slot actually vacated by a since-exited one. */
 static unsigned long long read_starttime(pid_t pid)
 {
     char path[32];
@@ -394,12 +647,6 @@ static unsigned long long read_starttime(pid_t pid)
     return starttime;
 }
 
-/* One scan pass: list /proc, find PIDs not in the previous scan's
- * seen-set, resolve their exe paths, and record a launch for each new
- * one. Rebuilds g_seen_pids fully each pass rather than incrementally
- * updating it -- simpler and correct, and a full /proc listing every
- * TRACK_INTERVAL_SEC (3s) is cheap enough that incremental bookkeeping
- * would be optimizing a cost that was never actually significant. */
 static void scan_once(void)
 {
     seen_pid_t new_seen[MAX_SEEN_PIDS];
@@ -416,7 +663,7 @@ static void scan_once(void)
         if (pid <= 0) continue;
 
         unsigned long long starttime = read_starttime(pid);
-        if (starttime == 0) continue;  /* process gone between listing and read */
+        if (starttime == 0) continue;
 
         new_seen[n_new_seen].pid = pid;
         new_seen[n_new_seen].starttime = starttime;
@@ -424,45 +671,49 @@ static void scan_once(void)
 
         if (!seen_contains(pid, starttime)) {
             char exe_path[256];
-            if (resolve_exe_path(pid, exe_path, sizeof(exe_path))) {
-                history_record_launch(exe_path, now);
-                gc_log(LOG_DEBUG, "launch detected: %s (pid %d)", exe_path, pid);
-            }
-            /* resolve_exe_path failing here is not logged as a
-             * warning -- kernel threads and processes that exit
-             * between the readdir listing and this readlink are both
-             * expected, routine occurrences on every scan, not
-             * anomalies worth surfacing. */
+            if (resolve_exe_path(pid, exe_path, sizeof(exe_path)))
+                history_record_launch(exe_path, pid, now);
         }
     }
     closedir(pd);
-
-    memcpy(g_seen_pids, new_seen, sizeof(seen_pid_t) * n_new_seen);
+    memcpy(g_seen_pids, new_seen, sizeof(seen_pid_t) * (size_t)n_new_seen);
     g_n_seen = n_new_seen;
+}
+
+static void init_budget(void)
+{
+    long total_kb = read_meminfo_kb("MemTotal:");
+    if (total_kb <= 0) total_kb = 2 * 1024 * 1024;
+    size_t by_pct = (size_t)total_kb * 1024ull * CACHE_BUDGET_PERCENT / 100ull;
+    g_budget_bytes = by_pct < CACHE_BUDGET_CAP_BYTES ? by_pct : CACHE_BUDGET_CAP_BYTES;
+    g_can_lock = (geteuid() == 0);
 }
 
 static void run_track_mode(void)
 {
-    gc_log(LOG_INFO, "gonzocache --track starting (interval=%ds, half-life=%dd)",
-           TRACK_INTERVAL_SEC, HALF_LIFE_SEC / 86400);
+    init_budget();
+    gc_log(LOG_INFO, "gonzocache --track starting (interval=%ds half-life=%dd budget=%zu MiB pin=%s)",
+           TRACK_INTERVAL_SEC, HALF_LIFE_SEC / 86400,
+           g_budget_bytes / 1024 / 1024, g_can_lock ? "yes" : "no");
 
     history_load();
-
-    /* First pass just establishes the baseline seen-set -- every PID
-     * already running when the tracker starts is "pre-existing", not
-     * a launch. Without this, restarting the tracker would spuriously
-     * record every currently-running process as a fresh launch. */
     scan_once();
     gc_log(LOG_INFO, "baseline established: %d processes already running", g_n_seen);
 
-    time_t last_save = time(NULL);
-    const time_t SAVE_INTERVAL_SEC = 60;  /* persist periodically, not every scan */
+    if (g_n_history > 0)
+        warm_from_history(1);
 
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, monitor_thread, NULL) == 0)
+        pthread_detach(tid);
+    else
+        gc_log(LOG_WARNING, "monitor thread failed: %s", strerror(errno));
+
+    time_t last_save = time(NULL);
     while (g_running) {
         sleep(TRACK_INTERVAL_SEC);
-        if (!g_running) break;  /* woke from sleep because of a caught signal */
+        if (!g_running) break;
         scan_once();
-
         time_t now = time(NULL);
         if (now - last_save >= SAVE_INTERVAL_SEC) {
             history_save();
@@ -470,156 +721,56 @@ static void run_track_mode(void)
         }
     }
 
-    /* Save on the way out regardless of how long it's been since the
-     * last periodic save -- this is the actual fix for the gap found
-     * by running the daemon end-to-end: without this, any launches
-     * recorded in the final (up to 60s) window before a normal
-     * stop/restart were silently lost. */
-    gc_log(LOG_INFO, "shutting down -- saving history");
+    gc_log(LOG_INFO, "shutting down — saving history, dropping hold");
     history_save();
+    hold_drop_all(1);
 }
 
-/* ── One-shot preload (--preload mode) ───────────────────────────────────
- *
- * Warms the top-scored executables into page cache via
- * posix_fadvise(POSIX_FADV_WILLNEED), then exits. Does not execute
- * anything -- this is a pure read-ahead hint to the kernel, the same
- * category of primitive as detritus.c's own MADV_COLD trickle, just
- * pointed the opposite direction (encourage caching in, not eviction
- * out).
- *
- * Scoped to the executable files themselves, not their shared-library
- * dependencies. Warming .so dependencies too is a real possible
- * enhancement (would meaningfully improve cold-launch time further)
- * but needs either shelling out to ldd -- fragile, output-format-
- * dependent, an extra process spawn per binary -- or parsing ELF
- * .dynamic sections directly, real complexity neither asked for nor
- * built here. Left as a natural, scoped follow-up rather than
- * speculatively built now.
+/*
+ * Login one-shot: fault the ranked files into page cache, do not pin,
+ * do not stay resident. The maps are released; the pages remain in
+ * cache only as long as kswapd leaves them.
  */
 static void run_preload_mode(void)
 {
+    init_budget();
+    g_can_lock = 0;
     history_load();
-    time_t now = time(NULL);
-
-    /* Decay every entry to "now" before ranking, so the top-N
-     * selection reflects true current standing (an app launched
-     * heavily two months ago and never since should rank below one
-     * launched moderately but recently), not scores frozen at
-     * whatever they were on each entry's own last launch. */
-    for (int i = 0; i < g_n_history; i++) {
-        double decay = decay_factor(now - g_history[i].last_launch_unix);
-        g_history[i].score *= decay;
-        g_history[i].last_launch_unix = now;
+    if (g_n_history == 0) {
+        gc_log(LOG_INFO, "preload: no history yet");
+        return;
     }
-
-    /* Simple insertion sort descending by score -- g_n_history is
-     * bounded by MAX_TRACKED_EXES (512), small enough that an O(n^2)
-     * sort is genuinely fine and not worth a more complex algorithm
-     * for. */
-    for (int i = 1; i < g_n_history; i++) {
-        history_entry_t key = g_history[i];
-        int j = i - 1;
-        while (j >= 0 && g_history[j].score < key.score) {
-            g_history[j + 1] = g_history[j];
-            j--;
-        }
-        g_history[j + 1] = key;
-    }
-
-    int warmed = 0;
-    char preloaded_paths[PRELOAD_TOP_N][256];
-    int  n_preloaded_paths = 0;
-
-    for (int i = 0; i < g_n_history && warmed < PRELOAD_TOP_N; i++) {
-        if (g_history[i].score < MIN_SCORE_TO_PRELOAD) break;  /* sorted descending; rest are lower */
-
-        int fd = open(g_history[i].path, O_RDONLY);
-        if (fd < 0) {
-            gc_log(LOG_DEBUG, "preload skip (open failed): %s: %s",
-                   g_history[i].path, strerror(errno));
-            continue;
-        }
-
-        int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
-        close(fd);
-
-        if (ret == 0) {
-            gc_log(LOG_INFO, "preloaded: %s (score=%.2f)",
-                   g_history[i].path, g_history[i].score);
-            memcpy(preloaded_paths[n_preloaded_paths], g_history[i].path,
-                   sizeof(preloaded_paths[0]));
-            n_preloaded_paths++;
-            warmed++;
-        } else {
-            gc_log(LOG_DEBUG, "preload skip (fadvise failed): %s: %s",
-                   g_history[i].path, strerror(ret));
-        }
-    }
-
-    gc_log(LOG_INFO, "preload complete: %d/%d candidates warmed", warmed,
-           g_n_history < PRELOAD_TOP_N ? g_n_history : PRELOAD_TOP_N);
-
-    /* Publish the list so detritus's write_status_file() can compute a
-     * live, continuously-updating page-cache-residency figure via
-     * mincore() on these exact files -- this is what turns a one-shot
-     * preload action into a real, live "GonzoCache usage" metric the
-     * GUI can display, rather than a static number that goes stale
-     * the moment this process exits. Plain newline-delimited paths,
-     * not JSON -- this file has exactly one purpose and a JSON schema
-     * would be unnecessary machinery for a flat path list. */
-    mkdir(HISTORY_DIR, 0755);
-    char preloaded_tmp[64];
-    snprintf(preloaded_tmp, sizeof(preloaded_tmp), HISTORY_DIR "/.preloaded.XXXXXX");
-    int pfd = mkstemp(preloaded_tmp);
-    if (pfd >= 0) {
-        fchmod(pfd, 0644);
-        FILE *pf = fdopen(pfd, "w");
-        if (pf) {
-            for (int i = 0; i < n_preloaded_paths; i++)
-                fprintf(pf, "%s\n", preloaded_paths[i]);
-            fflush(pf);
-            fsync(pfd);
-            fclose(pf);
-            char preloaded_path[64];
-            snprintf(preloaded_path, sizeof(preloaded_path), HISTORY_DIR "/preloaded.list");
-            if (rename(preloaded_tmp, preloaded_path) != 0) {
-                gc_log(LOG_WARNING, "preloaded-list save: rename failed: %s", strerror(errno));
-                unlink(preloaded_tmp);
-            }
-        } else {
-            close(pfd);
-            unlink(preloaded_tmp);
-        }
-    }
+    warm_from_history(0);
+    hold_drop_all(0);
 }
 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "Usage: %s --track    (run continuously, record launch history)\n"
-        "       %s --preload  (one-shot: warm top-ranked apps into page cache, then exit)\n",
+        "Usage: %s --track    (service: record launches, hold file cache)\n"
+        "       %s --preload  (one-shot: warm top-ranked apps, then exit)\n",
         argv0, argv0);
 }
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) { usage(argv[0]); return 1; }
+    if (argc != 2) {
+        usage(argv[0]);
+        return 1;
+    }
 
     if (strcmp(argv[1], "--track") == 0) {
         g_use_syslog = 1;
         openlog("gonzocache", LOG_PID, LOG_DAEMON);
         signal(SIGTERM, gc_sig_handler);
-        signal(SIGINT,  gc_sig_handler);
+        signal(SIGINT, gc_sig_handler);
         run_track_mode();
         return 0;
-    } else if (strcmp(argv[1], "--preload") == 0) {
+    }
+    if (strcmp(argv[1], "--preload") == 0) {
         run_preload_mode();
         return 0;
-    } else {
-        usage(argv[0]);
-        return 1;
     }
+    usage(argv[0]);
+    return 1;
 }
-
-

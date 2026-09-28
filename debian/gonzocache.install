@@ -1,0 +1,3 @@
+debian/gonzocache-preload.desktop etc/xdg/autostart/
+debian/gonzocache.run etc/sv/gonzocache/run
+runit/log/run etc/sv/gonzocache/log/run

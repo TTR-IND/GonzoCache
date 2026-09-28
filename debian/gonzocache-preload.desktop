@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=GonzoCache Preload
+Comment=Warms commonly-used apps into page cache at login
+Exec=/usr/sbin/gonzocache --preload
+X-GNOME-Autostart-enabled=true
+NoDisplay=true

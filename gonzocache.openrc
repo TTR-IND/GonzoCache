@@ -22,7 +22,7 @@
 # /etc/X11/Xsession.d/) for that half.
 
 name="gonzocache"
-description="App launch tracker for GonzoCache preloading"
+description="App launch tracker and watermarked file cache"
 command="/usr/local/sbin/gonzocache"
 command_args="--track"
 command_background="yes"

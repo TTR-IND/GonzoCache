@@ -1,0 +1,7 @@
+#!/bin/sh
+# gonzocache --track — runit run script
+#
+# The binary is foreground. runsv is the supervisor.
+# --preload stays a login autostart, not this service.
+exec 2>&1
+exec /usr/local/sbin/gonzocache --track

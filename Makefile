@@ -1,6 +1,6 @@
 CC       ?= gcc
 CFLAGS   ?= -O2 -Wall -Wextra -Wno-unused-parameter
-LDLIBS   := -lm
+LDLIBS   := -lm -lpthread
 PREFIX   ?= /usr/local
 SBINDIR  := $(PREFIX)/sbin
 

@@ -1,0 +1,15 @@
+Source: gonzocache
+Section: admin
+Priority: optional
+Maintainer: GonzOS Packaging <packages@gonzos.invalid>
+Build-Depends: debhelper-compat (= 13), gcc, make
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: gonzocache
+Architecture: any
+Depends: ${misc:Depends}, runit
+Description: login-time application cache warmer and tracker
+ gonzocache tracks application launches and warms frequently used executables
+ and mapped files into the page cache.  It includes a runit tracker service
+ and a desktop-login preload entry.
